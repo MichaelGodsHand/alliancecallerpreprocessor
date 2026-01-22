@@ -164,9 +164,74 @@ class JobStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
 
-# In-memory job storage (could be replaced with Redis/MongoDB for production)
+# In-memory job storage (cached, but also stored in S3 for multi-instance support)
 extraction_jobs = {}
 job_lock = threading.Lock()
+JOBS_S3_PREFIX = "extraction_jobs/"  # S3 prefix for job status storage
+
+# Functions to save/load job status from S3 (for multi-instance support)
+def save_job_to_s3(job_id: str, job_data: dict):
+    """Save job status to S3 so it can be accessed from any Cloud Run instance."""
+    if s3_client is None:
+        return False
+    
+    try:
+        import json
+        s3_key = f"{JOBS_S3_PREFIX}{job_id}.json"
+        job_json = json.dumps(job_data, default=str)  # default=str handles datetime and Enum serialization
+        s3_client.put_object(
+            Bucket=S3_BUCKET_NAME,
+            Key=s3_key,
+            Body=job_json.encode('utf-8'),
+            ContentType='application/json'
+        )
+        return True
+    except Exception as e:
+        print(f"  ⚠ Failed to save job {job_id} to S3: {e}")
+        return False
+
+def load_job_from_s3(job_id: str) -> dict:
+    """Load job status from S3."""
+    if s3_client is None:
+        return None
+    
+    try:
+        import json
+        s3_key = f"{JOBS_S3_PREFIX}{job_id}.json"
+        response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
+        job_json = response['Body'].read().decode('utf-8')
+        job_data = json.loads(job_json)
+        
+        # Convert status string back to JobStatus enum
+        if 'status' in job_data and isinstance(job_data['status'], str):
+            job_data['status'] = JobStatus(job_data['status'])
+        
+        return job_data
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            return None
+        print(f"  ⚠ Failed to load job {job_id} from S3: {e}")
+        return None
+    except Exception as e:
+        print(f"  ⚠ Failed to load job {job_id} from S3: {e}")
+        return None
+
+def get_job_status(job_id: str) -> dict:
+    """Get job status from in-memory cache or S3."""
+    # First check in-memory cache
+    with job_lock:
+        if job_id in extraction_jobs:
+            return extraction_jobs[job_id]
+    
+    # If not in cache, try loading from S3
+    job_data = load_job_from_s3(job_id)
+    if job_data:
+        # Cache it in memory for faster access
+        with job_lock:
+            extraction_jobs[job_id] = job_data
+        return job_data
+    
+    return None
 backup_lock = threading.Lock()  # Lock to prevent concurrent ChromaDB backups
 extraction_in_progress = False  # Flag to track if extraction is in progress
 extraction_lock = threading.Lock()  # Lock to protect extraction_in_progress flag
@@ -1568,6 +1633,8 @@ def process_extraction_job(job_id: str, files_data: list, use_ocr: bool, webhook
         with job_lock:
             extraction_jobs[job_id]["status"] = JobStatus.PROCESSING
             extraction_jobs[job_id]["started_at"] = datetime.now().isoformat()
+        # Save to S3 for multi-instance access
+        save_job_to_s3(job_id, extraction_jobs[job_id])
         
         print("\n" + "="*80)
         print(f"🚀 Starting batch PDF extraction (Job ID: {job_id})")
@@ -1724,11 +1791,13 @@ def process_extraction_job(job_id: str, files_data: list, use_ocr: bool, webhook
         if errors:
             response_data["errors"] = errors
         
-        # Update job status
+        # Update job status (in memory and S3)
         with job_lock:
             extraction_jobs[job_id]["status"] = JobStatus.COMPLETED if results else JobStatus.FAILED
             extraction_jobs[job_id]["completed_at"] = datetime.now().isoformat()
             extraction_jobs[job_id]["result"] = response_data
+        # Save to S3 for multi-instance access
+        save_job_to_s3(job_id, extraction_jobs[job_id])
         
         print("\n" + "="*80)
         print(f"🎉 Batch extraction complete! (Job ID: {job_id})")
@@ -1752,7 +1821,7 @@ def process_extraction_job(job_id: str, files_data: list, use_ocr: bool, webhook
         error_msg = str(e)
         print(f"\n❌ Job {job_id} failed: {error_msg}\n")
         
-        # Update job status to failed
+        # Update job status to failed (in memory and S3)
         with job_lock:
             extraction_jobs[job_id]["status"] = JobStatus.FAILED
             extraction_jobs[job_id]["completed_at"] = datetime.now().isoformat()
@@ -1762,6 +1831,8 @@ def process_extraction_job(job_id: str, files_data: list, use_ocr: bool, webhook
                 "status": "failed",
                 "error": error_msg
             }
+        # Save to S3 for multi-instance access
+        save_job_to_s3(job_id, extraction_jobs[job_id])
         
         # Send webhook notification for failure
         if webhook_url:
@@ -1813,18 +1884,21 @@ async def extract_text(
             contents = await file.read()
             files_data.append((file.filename, contents))
         
-        # Initialize job tracking
+        # Initialize job tracking (in memory and S3)
+        job_data = {
+            "job_id": job_id,
+            "status": JobStatus.PENDING,
+            "created_at": datetime.now().isoformat(),
+            "total_files": len(files),
+            "use_ocr": use_ocr,
+            "webhook_url": webhook_url,
+            "result": None,
+            "error": None
+        }
         with job_lock:
-            extraction_jobs[job_id] = {
-                "job_id": job_id,
-                "status": JobStatus.PENDING,
-                "created_at": datetime.now().isoformat(),
-                "total_files": len(files),
-                "use_ocr": use_ocr,
-                "webhook_url": webhook_url,
-                "result": None,
-                "error": None
-            }
+            extraction_jobs[job_id] = job_data
+        # Also save to S3 for multi-instance access
+        save_job_to_s3(job_id, job_data)
         
         # Start background processing
         print(f"\n🔄 Starting async extraction job: {job_id}")
@@ -1913,36 +1987,37 @@ async def get_extraction_status(job_id: str):
     Returns:
         Job status and result (if completed)
     """
-    with job_lock:
-        if job_id not in extraction_jobs:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Job {job_id} not found"
-            )
-        
-        job = extraction_jobs[job_id]
-        
-        response = {
-            "job_id": job_id,
-            "status": job["status"].value,
-            "created_at": job["created_at"],
-            "total_files": job["total_files"],
-            "use_ocr": job["use_ocr"],
-            "webhook_url": job.get("webhook_url")
-        }
-        
-        if "started_at" in job:
-            response["started_at"] = job["started_at"]
-        
-        if "completed_at" in job:
-            response["completed_at"] = job["completed_at"]
-        
-        if job["status"] in [JobStatus.COMPLETED, JobStatus.FAILED]:
-            response["result"] = job["result"]
-            if job.get("error"):
-                response["error"] = job["error"]
-        
-        return JSONResponse(content=response)
+    # Try to get job from cache or S3
+    job = get_job_status(job_id)
+    
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Job {job_id} not found"
+        )
+    
+    response = {
+        "job_id": job_id,
+        "status": job["status"].value if isinstance(job["status"], JobStatus) else job["status"],
+        "created_at": job["created_at"],
+        "total_files": job["total_files"],
+        "use_ocr": job["use_ocr"],
+        "webhook_url": job.get("webhook_url")
+    }
+    
+    if "started_at" in job:
+        response["started_at"] = job["started_at"]
+    
+    if "completed_at" in job:
+        response["completed_at"] = job["completed_at"]
+    
+    job_status = job["status"] if isinstance(job["status"], JobStatus) else JobStatus(job["status"])
+    if job_status in [JobStatus.COMPLETED, JobStatus.FAILED]:
+        response["result"] = job["result"]
+        if job.get("error"):
+            response["error"] = job["error"]
+    
+    return JSONResponse(content=response)
 
 
 @app.post("/query", response_model=QueryResponse)
