@@ -1643,6 +1643,16 @@ def process_extraction_job(job_id: str, files_data: list, use_ocr: bool, webhook
         print(f"🔧 OCR available: {TESSERACT_FOUND}")
         print("="*80)
         
+        # CRITICAL: Initialize models BEFORE processing files (prevents hanging on first file)
+        print(f"\n🔧 Initializing models and ChromaDB (this may take time on cold start)...")
+        try:
+            ensure_models_initialized()
+            print(f"  ✅ Models initialized successfully")
+        except Exception as init_error:
+            error_msg = f"Failed to initialize models: {str(init_error)}"
+            print(f"  ❌ {error_msg}")
+            raise Exception(error_msg)
+        
         # Send initial webhook notification when job starts
         if webhook_url:
             try:
@@ -1681,30 +1691,42 @@ def process_extraction_job(job_id: str, files_data: list, use_ocr: bool, webhook
                 print(f"  📥 File size: {len(contents)} bytes")
                 
                 # Upload full PDF to S3 first
+                print(f"  📤 Uploading full PDF to S3...")
                 full_pdf_s3_url = upload_full_pdf_to_s3(contents, filename)
                 if full_pdf_s3_url:
                     pdf_s3_urls[filename] = full_pdf_s3_url
+                    print(f"  ✅ PDF uploaded to S3: {full_pdf_s3_url}")
                 
                 # Extract text
+                print(f"  📄 Extracting text from PDF (OCR: {use_ocr})...")
                 extracted_text, page_objects, doc = extract_text_from_pdf(contents, filename, use_ocr)
+                print(f"  ✅ Extracted {len(extracted_text)} pages")
                 
                 # Store each page in ChromaDB and upload to S3
                 pdf_name = Path(filename).stem
                 print(f"\n  💾 Storing pages in ChromaDB and uploading to S3...")
                 
-                for page_identifier, text in extracted_text.items():
+                for page_idx, (page_identifier, text) in enumerate(extracted_text.items(), 1):
                     # Extract page number from identifier
                     page_number = int(page_identifier.split('&')[1])
                     
                     # Store in ChromaDB
+                    print(f"    📝 Storing page {page_idx}/{len(extracted_text)} ({page_identifier}) in ChromaDB...", end="", flush=True)
                     if store_in_chromadb(page_identifier, text, pdf_name, page_number):
                         stored_count += 1
+                        print(" ✓")
+                    else:
+                        print(" ⚠")
                     
                     # Upload page image to S3
+                    print(f"    📤 Uploading page {page_idx}/{len(extracted_text)} image to S3...", end="", flush=True)
                     page = page_objects[page_identifier]
                     s3_url = upload_page_to_s3(page, page_identifier)
                     if s3_url:
                         s3_upload_count += 1
+                        print(" ✓")
+                    else:
+                        print(" ⚠")
                 
                 # Close the document
                 doc.close()
@@ -1737,9 +1759,13 @@ def process_extraction_job(job_id: str, files_data: list, use_ocr: bool, webhook
                         # Don't fail the extraction if webhook fails
                 
             except Exception as e:
+                import traceback
                 error_msg = f"{filename}: {str(e)}"
+                error_traceback = traceback.format_exc()
                 errors.append(error_msg)
                 print(f"  ❌ Failed: {error_msg}")
+                print(f"  📋 Traceback:")
+                print(error_traceback)
                 
                 # Send progress webhook notification even on error (to report the error)
                 if webhook_url:
@@ -1818,14 +1844,20 @@ def process_extraction_job(job_id: str, files_data: list, use_ocr: bool, webhook
                 # Don't fail the extraction if webhook fails
         
     except Exception as e:
+        import traceback
         error_msg = str(e)
-        print(f"\n❌ Job {job_id} failed: {error_msg}\n")
+        error_traceback = traceback.format_exc()
+        print(f"\n❌ Job {job_id} failed: {error_msg}")
+        print(f"📋 Full traceback:")
+        print(error_traceback)
+        print("="*80 + "\n")
         
         # Update job status to failed (in memory and S3)
         with job_lock:
             extraction_jobs[job_id]["status"] = JobStatus.FAILED
             extraction_jobs[job_id]["completed_at"] = datetime.now().isoformat()
             extraction_jobs[job_id]["error"] = error_msg
+            extraction_jobs[job_id]["error_traceback"] = error_traceback  # Store full traceback for debugging
             extraction_jobs[job_id]["result"] = {
                 "job_id": job_id,
                 "status": "failed",
