@@ -182,27 +182,6 @@ _pdf_names_cache_lock = threading.Lock()
 _pdf_names_cache_valid = False  # Flag to indicate if cache needs refresh
 
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize models on startup in background thread to avoid blocking server startup."""
-    def init_in_background():
-        """Initialize models in background thread."""
-        try:
-            # Download ChromaDB from S3 first
-            print("📥 Starting ChromaDB download from S3...")
-            download_chromadb_from_s3()
-            # Then initialize models
-            print("🚀 Starting model initialization...")
-            initialize_models()
-            print("✅ Background initialization complete")
-        except Exception as e:
-            print(f"⚠️ Error during background initialization: {e}")
-    
-    # Start initialization in background thread (non-blocking)
-    threading.Thread(target=init_in_background, daemon=True).start()
-    print("🚀 Server starting, initialization running in background...")
-
-
 @app.head("/health")
 async def health_check():
     """
@@ -217,7 +196,7 @@ CALENDAR_SCOPES = ['https://www.googleapis.com/auth/calendar']
 
 # Initialize OpenAI client (with error handling)
 # Note: OpenAI client is used for other features (like calendar, course determination), not for embeddings
-# Embeddings are handled by SentenceTransformer in initialize_models()
+# Embeddings are handled by SentenceTransformer (lazy initialization via ensure_models_initialized())
 openai_api_key = os.getenv("OPENAI_API_KEY")
 if not openai_api_key:
     print("\n⚠️  WARNING: OPENAI_API_KEY not found in .env file or environment!")
@@ -389,93 +368,117 @@ os.makedirs(CHROMADB_LOCAL_PATH, exist_ok=True)
 embedding_model = None
 chroma_client = None
 collection = None
+_models_initialized = False
+_models_init_lock = threading.Lock()
 
 # Chunk settings
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 100
 
-# Note: ChromaDB initialization is handled by initialize_models() on startup
+# Download ChromaDB from S3 in background thread (non-blocking)
+def download_chromadb_background():
+    """Download ChromaDB from S3 in background thread."""
+    try:
+        print("📥 Starting ChromaDB download from S3 in background...")
+        download_chromadb_from_s3()
+        print("✅ ChromaDB download from S3 completed")
+    except Exception as e:
+        print(f"⚠️ Error downloading ChromaDB from S3: {e}")
 
+# Start ChromaDB download in background thread (non-blocking)
+threading.Thread(target=download_chromadb_background, daemon=True).start()
 
-def initialize_models():
-    """Initialize embedding model and ChromaDB."""
-    global embedding_model, chroma_client, collection
-    
-    print("🚀 Initializing models...")
-    
-    # Initialize embedding model
-    embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-    print("✅ Embedding model loaded")
-    
-    # Initialize ChromaDB with persistent storage
-    persist_directory = "./chroma_db"
-    os.makedirs(persist_directory, exist_ok=True)
-    
+# Initialize ChromaDB at module level (fast, non-blocking)
+try:
     chroma_client = chromadb.PersistentClient(
-        path=persist_directory,
+        path=CHROMADB_LOCAL_PATH,
         settings=Settings(
             anonymized_telemetry=False,
             allow_reset=True
         )
     )
-    print(f"✅ ChromaDB initialized with persistent storage at: {persist_directory}")
+    print(f"✅ ChromaDB client initialized at: {CHROMADB_LOCAL_PATH}")
+except Exception as e:
+    print(f"⚠️ Error initializing ChromaDB client: {e}")
+    chroma_client = None
+
+
+def ensure_models_initialized():
+    """Ensure models are initialized (lazy initialization)."""
+    global embedding_model, collection, _models_initialized
     
-    # Create or get collection
-    # Check if collection exists and handle embedding dimension mismatch
-    try:
-        existing_collection = chroma_client.get_collection(name="pdf_documents")
-        # Test if collection accepts our embedding dimension by trying to add a test document
-        test_embedding = embedding_model.encode(["test"])[0].tolist()
+    if _models_initialized:
+        return
+    
+    with _models_init_lock:
+        if _models_initialized:
+            return
+        
         try:
-            # Try to add a test document to check if dimension matches
-            existing_collection.add(
-                documents=["test"],
-                embeddings=[test_embedding],
-                metadatas=[{"test": "true"}],
-                ids=["dimension_test"]
-            )
-            # If successful, delete the test document and use the collection
-            existing_collection.delete(ids=["dimension_test"])
-            collection = existing_collection
-            existing_count = collection.count()
-            print(f"✅ Existing collection loaded with {existing_count} chunks")
-        except Exception as e:
-            # Dimension mismatch - delete and recreate collection
-            error_msg = str(e)
-            if "dimension" in error_msg.lower() or "1536" in error_msg or "384" in error_msg:
-                print(f"🔄 Collection has wrong embedding dimension. Resetting...")
+            print("🚀 Initializing models (lazy initialization)...")
+            
+            # Initialize embedding model
+            embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+            print("✅ Embedding model loaded")
+            
+            # Initialize collection if ChromaDB client is available
+            if chroma_client is not None:
                 try:
-                    chroma_client.delete_collection(name="pdf_documents")
-                except:
-                    pass
-                collection = chroma_client.create_collection(
-                    name="pdf_documents",
-                    metadata={"hnsw:space": "cosine"}
-                )
-                print("✅ Collection recreated with SentenceTransformer embeddings (384 dimensions)")
+                    existing_collection = chroma_client.get_collection(name="pdf_documents")
+                    # Test if collection accepts our embedding dimension
+                    test_embedding = embedding_model.encode(["test"])[0].tolist()
+                    try:
+                        existing_collection.add(
+                            documents=["test"],
+                            embeddings=[test_embedding],
+                            metadatas=[{"test": "true"}],
+                            ids=["dimension_test"]
+                        )
+                        existing_collection.delete(ids=["dimension_test"])
+                        collection = existing_collection
+                        existing_count = collection.count()
+                        print(f"✅ Existing collection loaded with {existing_count} chunks")
+                    except Exception as e:
+                        error_msg = str(e)
+                        if "dimension" in error_msg.lower() or "1536" in error_msg or "384" in error_msg:
+                            print(f"🔄 Collection has wrong embedding dimension. Resetting...")
+                            try:
+                                chroma_client.delete_collection(name="pdf_documents")
+                            except:
+                                pass
+                            collection = chroma_client.create_collection(
+                                name="pdf_documents",
+                                metadata={"hnsw:space": "cosine"}
+                            )
+                            print("✅ Collection recreated with SentenceTransformer embeddings (384 dimensions)")
+                        else:
+                            raise
+                except Exception as e:
+                    if "not found" in str(e).lower() or "does not exist" in str(e).lower():
+                        collection = chroma_client.create_collection(
+                            name="pdf_documents",
+                            metadata={"hnsw:space": "cosine"}
+                        )
+                        print("✅ New collection created")
+                    else:
+                        print(f"⚠️  Error accessing collection: {str(e)}")
+                        try:
+                            chroma_client.delete_collection(name="pdf_documents")
+                        except:
+                            pass
+                        collection = chroma_client.create_collection(
+                            name="pdf_documents",
+                            metadata={"hnsw:space": "cosine"}
+                        )
+                        print("✅ Collection recreated")
             else:
-                # Some other error, re-raise it
-                raise
-    except Exception as e:
-        # Collection doesn't exist or other error, create it
-        if "not found" in str(e).lower() or "does not exist" in str(e).lower():
-            collection = chroma_client.create_collection(
-                name="pdf_documents",
-                metadata={"hnsw:space": "cosine"}
-            )
-            print("✅ New collection created")
-        else:
-            # Unexpected error, try to delete and recreate
-            print(f"⚠️  Error accessing collection: {str(e)}")
-            try:
-                chroma_client.delete_collection(name="pdf_documents")
-            except:
-                pass
-            collection = chroma_client.create_collection(
-                name="pdf_documents",
-                metadata={"hnsw:space": "cosine"}
-            )
-            print("✅ Collection recreated")
+                print("⚠️  ChromaDB client not available, collection not initialized")
+            
+            _models_initialized = True
+            print("✅ Models initialization complete")
+        except Exception as e:
+            print(f"⚠️ Error initializing models: {e}")
+            raise
 
 
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP):
@@ -493,7 +496,13 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
 
 def add_documents_to_chromadb(pdf_text_dict):
     """Process documents, create chunks, embeddings, and add to ChromaDB."""
+    # Ensure models are initialized (lazy initialization)
+    ensure_models_initialized()
+    
     global collection, embedding_model
+    
+    if collection is None or embedding_model is None:
+        raise Exception("Collection or embedding model not initialized")
     
     print(f"\n{'='*80}")
     print("🔄 Processing documents for ChromaDB")
@@ -1054,6 +1063,14 @@ def extract_text_from_pdf(pdf_bytes, pdf_filename, use_ocr=True):
 
 def store_in_chromadb(page_identifier, text, pdf_name, page_number):
     """Store extracted text in ChromaDB with metadata. Prevents duplicates."""
+    # Ensure models are initialized (lazy initialization)
+    ensure_models_initialized()
+    
+    global collection
+    if collection is None:
+        print(f" ✗ Failed (Collection not initialized)")
+        return False
+    
     try:
         print(f"    💾 Storing {page_identifier} in ChromaDB...", end="", flush=True)
         
@@ -1634,10 +1651,13 @@ async def query_documents(request: QueryRequest):
     Returns top K most similar chunks using cosine similarity.
     """
     try:
+        # Ensure models are initialized (lazy initialization)
+        ensure_models_initialized()
+        
         global collection, embedding_model
         
-        if collection is None:
-            raise HTTPException(status_code=500, detail="Collection not initialized")
+        if collection is None or embedding_model is None:
+            raise HTTPException(status_code=500, detail="Collection or embedding model not initialized")
         
         # Generate query embedding
         query_embedding = embedding_model.encode([request.query])[0].tolist()
