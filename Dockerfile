@@ -21,6 +21,10 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Pre-download SentenceTransformer model during build (prevents runtime download)
+# This caches the ~80MB model in the Docker image for faster cold starts
+RUN python -c "from sentence_transformers import SentenceTransformer; print('📥 Downloading SentenceTransformer model...'); model = SentenceTransformer('all-MiniLM-L6-v2'); print('✅ Model downloaded and cached')"
+
 # Copy the rest of the application code
 COPY . .
 
