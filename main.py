@@ -1230,7 +1230,7 @@ def create_calendar_event(title: str, date: str, start_time: str, end_time: str,
 
 
 def extract_text_with_ocr(page, page_num, pdf_name):
-    """Extract text from a PDF page using OCR."""
+    """Extract text from a PDF page using OCR with timeout."""
     global TESSERACT_FOUND
     
     if not TESSERACT_FOUND:
@@ -1239,19 +1239,48 @@ def extract_text_with_ocr(page, page_num, pdf_name):
     
     try:
         print(f"    🔍 Running OCR on {pdf_name}&{page_num}...", end="", flush=True)
+        
+        # Step 1: Convert page to pixmap
+        print(" [1/4 Rendering]...", end="", flush=True)
         mat = fitz.Matrix(2.0, 2.0)
         pix = page.get_pixmap(matrix=mat)
+        
+        # Step 2: Convert to bytes
+        print(" [2/4 Converting]...", end="", flush=True)
         img_data = pix.tobytes("png")
+        
+        # Step 3: Open as PIL image
+        print(" [3/4 Loading]...", end="", flush=True)
         img = Image.open(BytesIO(img_data))
-        ocr_text = pytesseract.image_to_string(img, lang='eng')
-        print(" ✓ Done")
-        return ocr_text.strip()
+        
+        # Step 4: Run Tesseract OCR with timeout (this is the slow part)
+        print(" [4/4 OCR]...", end="", flush=True)
+        
+        import concurrent.futures
+        
+        def run_ocr():
+            return pytesseract.image_to_string(img, lang='eng')
+        
+        # Use ThreadPoolExecutor with timeout (works on all platforms)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(run_ocr)
+            try:
+                ocr_text = future.result(timeout=120)  # 120 second timeout for OCR
+                print(" ✓ Done", flush=True)
+                return ocr_text.strip()
+            except concurrent.futures.TimeoutError:
+                print(f" ⏱️ TIMEOUT (OCR took >120s, skipping)", flush=True)
+                return ""
+            except Exception as ocr_error:
+                print(f" ✗ OCR Error: {str(ocr_error)}", flush=True)
+                return ""
+                
     except pytesseract.TesseractNotFoundError:
         TESSERACT_FOUND = False
-        print(" ✗ Failed (Tesseract not found)")
+        print(" ✗ Failed (Tesseract not found)", flush=True)
         return ""
     except Exception as e:
-        print(f" ✗ Failed ({str(e)})")
+        print(f" ✗ Failed ({str(e)})", flush=True)
         return ""
 
 
@@ -1271,23 +1300,25 @@ def extract_text_from_pdf(pdf_bytes, pdf_filename, use_ocr=True):
         print(f"{'='*80}\n")
         
         for page_num in range(len(doc)):
+            print(f"  📖 Page {page_num + 1}/{len(doc)} - Starting...", flush=True)
+            
             page = doc[page_num]
             page_identifier = f"{pdf_name}&{page_num + 1}"
-            
-            print(f"  📖 Page {page_num + 1}/{len(doc)} ({page_identifier})")
+            print(f"     ID: {page_identifier}", flush=True)
             
             print(f"    📝 Extracting regular text...", end="", flush=True)
             regular_text = page.get_text()
             regular_char_count = len(regular_text.strip())
-            print(f" ✓ ({regular_char_count} chars)")
+            print(f" ✓ ({regular_char_count} chars)", flush=True)
             
             ocr_text = ""
             ocr_char_count = 0
             if use_ocr:
+                print(f"    🔍 Starting OCR...", flush=True)
                 ocr_text = extract_text_with_ocr(page, page_num + 1, pdf_name)
                 ocr_char_count = len(ocr_text.strip())
                 if ocr_text:
-                    print(f"      ✓ OCR extracted {ocr_char_count} chars")
+                    print(f"      ✓ OCR extracted {ocr_char_count} chars", flush=True)
             
             if regular_text.strip() and ocr_text.strip():
                 if regular_text.strip() in ocr_text or len(regular_text.strip()) < 50:
