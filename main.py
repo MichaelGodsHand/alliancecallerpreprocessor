@@ -809,35 +809,46 @@ def send_webhook_notification(webhook_url: str, job_id: str, job_data: dict, max
         job_data: Data to send in the webhook
         max_retries: Maximum number of retry attempts
     """
-    # Clean the webhook URL first
-    cleaned_url = clean_webhook_url(webhook_url)
-    print(f"  🔧 Using cleaned URL for request: {cleaned_url}")
+    if not webhook_url:
+        print(f"  ⚠ No webhook URL provided, skipping notification")
+        return False
     
-    for attempt in range(max_retries):
-        try:
-            print(f"  📡 Sending webhook notification (attempt {attempt + 1}/{max_retries})...")
-            print(f"  🔍 POST request to: {cleaned_url}")
-            response = requests.post(
-                cleaned_url,
-                json=job_data,
-                headers={"Content-Type": "application/json"},
-                timeout=30,
-                allow_redirects=False
-            )
-            response.raise_for_status()
-            print(f"  ✓ Webhook notification sent successfully (status: {response.status_code})")
-            return True
-        except requests.exceptions.RequestException as e:
-            print(f"  ⚠ Webhook notification failed (attempt {attempt + 1}/{max_retries}): {str(e)}")
-            if attempt < max_retries - 1:
-                # Exponential backoff: wait 2^attempt seconds
-                wait_time = 2 ** attempt
-                print(f"  ⏳ Retrying in {wait_time} seconds...")
-                time.sleep(wait_time)
-            else:
-                print(f"  ✗ Webhook notification failed after {max_retries} attempts")
-                return False
-    return False
+    try:
+        # Clean the webhook URL first
+        cleaned_url = clean_webhook_url(webhook_url)
+        print(f"  🔧 Using cleaned URL for request: {cleaned_url}")
+        
+        for attempt in range(max_retries):
+            try:
+                print(f"  📡 Sending webhook notification (attempt {attempt + 1}/{max_retries})...")
+                print(f"  🔍 POST request to: {cleaned_url}")
+                print(f"  📦 Payload: job_id={job_id}, status={job_data.get('status', 'unknown')}")
+                response = requests.post(
+                    cleaned_url,
+                    json=job_data,
+                    headers={"Content-Type": "application/json"},
+                    timeout=30,
+                    allow_redirects=False
+                )
+                response.raise_for_status()
+                print(f"  ✓ Webhook notification sent successfully (status: {response.status_code})")
+                return True
+            except requests.exceptions.RequestException as e:
+                print(f"  ⚠ Webhook notification failed (attempt {attempt + 1}/{max_retries}): {str(e)}")
+                if attempt < max_retries - 1:
+                    # Exponential backoff: wait 2^attempt seconds
+                    wait_time = 2 ** attempt
+                    print(f"  ⏳ Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    print(f"  ✗ Webhook notification failed after {max_retries} attempts")
+                    return False
+        return False
+    except Exception as e:
+        print(f"  ✗ Error in send_webhook_notification: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 
 def normalize_phone_number(phone_number: str) -> str:
@@ -1565,6 +1576,25 @@ def process_extraction_job(job_id: str, files_data: list, use_ocr: bool, webhook
         print(f"🔧 OCR available: {TESSERACT_FOUND}")
         print("="*80)
         
+        # Send initial webhook notification when job starts
+        if webhook_url:
+            try:
+                initial_data = {
+                    "job_id": job_id,
+                    "status": "processing",
+                    "message": "Extraction job started",
+                    "total_files": len(files_data),
+                    "files_processed": 0,
+                    "progress_percentage": 0,
+                    "ocr_enabled": use_ocr,
+                    "ocr_available": TESSERACT_FOUND
+                }
+                print(f"  📡 Sending initial webhook notification...")
+                send_webhook_notification(webhook_url, job_id, initial_data)
+            except Exception as webhook_error:
+                print(f"  ⚠ Error sending initial webhook: {str(webhook_error)}")
+                # Don't fail the extraction if webhook fails
+        
         results = {}
         errors = []
         stored_count = 0
@@ -1617,23 +1647,27 @@ def process_extraction_job(job_id: str, files_data: list, use_ocr: bool, webhook
                 
                 # Send progress webhook notification after each file is processed
                 if webhook_url:
-                    progress_data = {
-                        "job_id": job_id,
-                        "status": "processing",
-                        "current_file": filename,
-                        "current_file_index": idx,
-                        "total_files": len(files_data),
-                        "files_processed": idx,
-                        "total_pages_extracted": len(results),
-                        "total_pages_stored_in_db": stored_count,
-                        "total_pages_uploaded_to_s3": s3_upload_count,
-                        "progress_percentage": int((idx / len(files_data)) * 100),
-                        "ocr_enabled": use_ocr,
-                        "ocr_available": TESSERACT_FOUND,
-                        "errors": errors.copy() if errors else []
-                    }
-                    print(f"  📡 Sending progress webhook notification...")
-                    send_webhook_notification(webhook_url, job_id, progress_data)
+                    try:
+                        progress_data = {
+                            "job_id": job_id,
+                            "status": "processing",
+                            "current_file": filename,
+                            "current_file_index": idx,
+                            "total_files": len(files_data),
+                            "files_processed": idx,
+                            "total_pages_extracted": len(results),
+                            "total_pages_stored_in_db": stored_count,
+                            "total_pages_uploaded_to_s3": s3_upload_count,
+                            "progress_percentage": int((idx / len(files_data)) * 100),
+                            "ocr_enabled": use_ocr,
+                            "ocr_available": TESSERACT_FOUND,
+                            "errors": errors.copy() if errors else []
+                        }
+                        print(f"  📡 Sending progress webhook notification...")
+                        send_webhook_notification(webhook_url, job_id, progress_data)
+                    except Exception as webhook_error:
+                        print(f"  ⚠ Error sending progress webhook: {str(webhook_error)}")
+                        # Don't fail the extraction if webhook fails
                 
             except Exception as e:
                 error_msg = f"{filename}: {str(e)}"
@@ -1642,24 +1676,28 @@ def process_extraction_job(job_id: str, files_data: list, use_ocr: bool, webhook
                 
                 # Send progress webhook notification even on error (to report the error)
                 if webhook_url:
-                    progress_data = {
-                        "job_id": job_id,
-                        "status": "processing",
-                        "current_file": filename,
-                        "current_file_index": idx,
-                        "total_files": len(files_data),
-                        "files_processed": idx,
-                        "total_pages_extracted": len(results),
-                        "total_pages_stored_in_db": stored_count,
-                        "total_pages_uploaded_to_s3": s3_upload_count,
-                        "progress_percentage": int((idx / len(files_data)) * 100),
-                        "ocr_enabled": use_ocr,
-                        "ocr_available": TESSERACT_FOUND,
-                        "errors": errors.copy() if errors else [],
-                        "last_error": error_msg
-                    }
-                    print(f"  📡 Sending progress webhook notification (with error)...")
-                    send_webhook_notification(webhook_url, job_id, progress_data)
+                    try:
+                        progress_data = {
+                            "job_id": job_id,
+                            "status": "processing",
+                            "current_file": filename,
+                            "current_file_index": idx,
+                            "total_files": len(files_data),
+                            "files_processed": idx,
+                            "total_pages_extracted": len(results),
+                            "total_pages_stored_in_db": stored_count,
+                            "total_pages_uploaded_to_s3": s3_upload_count,
+                            "progress_percentage": int((idx / len(files_data)) * 100),
+                            "ocr_enabled": use_ocr,
+                            "ocr_available": TESSERACT_FOUND,
+                            "errors": errors.copy() if errors else [],
+                            "last_error": error_msg
+                        }
+                        print(f"  📡 Sending progress webhook notification (with error)...")
+                        send_webhook_notification(webhook_url, job_id, progress_data)
+                    except Exception as webhook_error:
+                        print(f"  ⚠ Error sending error webhook: {str(webhook_error)}")
+                        # Don't fail the extraction if webhook fails
         
         # Backup ChromaDB to S3 after extraction completes
         if stored_count > 0 and s3_client is not None:
@@ -1703,8 +1741,12 @@ def process_extraction_job(job_id: str, files_data: list, use_ocr: bool, webhook
         
         # Send webhook notification if provided
         if webhook_url:
-            print(f"  🔔 Sending webhook notification to {webhook_url}...")
-            send_webhook_notification(webhook_url, job_id, response_data)
+            try:
+                print(f"  🔔 Sending final webhook notification to {webhook_url}...")
+                send_webhook_notification(webhook_url, job_id, response_data)
+            except Exception as webhook_error:
+                print(f"  ⚠ Error sending final webhook: {str(webhook_error)}")
+                # Don't fail the extraction if webhook fails
         
     except Exception as e:
         error_msg = str(e)
@@ -1723,13 +1765,17 @@ def process_extraction_job(job_id: str, files_data: list, use_ocr: bool, webhook
         
         # Send webhook notification for failure
         if webhook_url:
-            print(f"  🔔 Sending failure webhook notification to {webhook_url}...")
-            failure_data = {
-                "job_id": job_id,
-                "status": "failed",
-                "error": error_msg
-            }
-            send_webhook_notification(webhook_url, job_id, failure_data)
+            try:
+                print(f"  🔔 Sending failure webhook notification to {webhook_url}...")
+                failure_data = {
+                    "job_id": job_id,
+                    "status": "failed",
+                    "error": error_msg
+                }
+                send_webhook_notification(webhook_url, job_id, failure_data)
+            except Exception as webhook_error:
+                print(f"  ⚠ Error sending failure webhook: {str(webhook_error)}")
+                # Don't fail if webhook fails
     finally:
         # Always reset extraction flag when done
         with extraction_lock:
