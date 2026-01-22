@@ -1982,13 +1982,17 @@ async def extract_text(
         save_job_to_s3(job_id, job_data)
         
         # Start background processing
+        # IMPORTANT: daemon=False keeps the process alive until extraction completes
+        # This prevents Cloud Run from killing the thread mid-processing
         print(f"\n🔄 Starting async extraction job: {job_id}")
         print(f"📡 Webhook URL: {webhook_url}")
-        threading.Thread(
+        extraction_thread = threading.Thread(
             target=process_extraction_job,
             args=(job_id, files_data, use_ocr, webhook_url),
-            daemon=True
-        ).start()
+            daemon=False  # CRITICAL: Non-daemon thread keeps process alive
+        )
+        extraction_thread.start()
+        print(f"  ✅ Extraction thread started (non-daemon - will keep instance alive)")
         
         # Return immediately with job ID
         return JSONResponse(content={
