@@ -12,17 +12,10 @@ import tarfile
 import shutil
 import threading
 import time
-import atexit
 from datetime import datetime
 from enum import Enum
 from urllib.parse import urlparse, parse_qs, unquote
 
-try:
-    from pyngrok import ngrok
-    PYNGROK_AVAILABLE = True
-except ImportError:
-    PYNGROK_AVAILABLE = False
-    print("⚠️  pyngrok not found. Install with: pip install pyngrok")
 
 try:
     import fitz  # PyMuPDF.
@@ -183,74 +176,6 @@ _cached_pdf_names = set()
 _pdf_names_cache_lock = threading.Lock()
 _pdf_names_cache_valid = False  # Flag to indicate if cache needs refresh
 
-# Ngrok tunnel variable
-ngrok_tunnel = None
-
-
-def start_ngrok_tunnel(port=8080):
-    """Start ngrok tunnel for the FastAPI service"""
-    global ngrok_tunnel
-    
-    if not PYNGROK_AVAILABLE:
-        print("⚠️  pyngrok not available, skipping ngrok tunnel")
-        return None
-    
-    ngrok_auth_token = os.getenv("NGROK_AUTH_TOKEN")
-    
-    if ngrok_auth_token:
-        try:
-            ngrok.set_auth_token(ngrok_auth_token)
-            print("✓ Using ngrok auth token from environment")
-        except Exception as e:
-            print(f"⚠️  Failed to set ngrok auth token: {e}")
-    else:
-        print("⚠️  NGROK_AUTH_TOKEN not set, using free ngrok (may have limitations)")
-    
-    try:
-        ngrok_tunnel = ngrok.connect(port, "http")
-        public_url = ngrok_tunnel.public_url
-        
-        print("\n" + "="*80)
-        print("🚀 ngrok tunnel started successfully!")
-        print(f"📞 Public URL: {public_url}")
-        print(f"🌐 Extract endpoint: {public_url}/extract")
-        print(f"🔍 Query endpoint: {public_url}/query")
-        print(f"💚 Health check: {public_url}/health")
-        print("="*80 + "\n")
-        
-        atexit.register(cleanup_ngrok)
-        return public_url
-    except Exception as e:
-        error_msg = str(e)
-        print(f"⚠️  Failed to start ngrok tunnel: {error_msg}")
-        
-        # Check if it's a version error
-        if "too old" in error_msg.lower() or "minimum" in error_msg.lower():
-            print("="*80)
-            print("❌ ngrok agent version is too old!")
-            print("💡 Solution: Update pyngrok to the latest version:")
-            print("   pip install --upgrade pyngrok")
-            print("="*80)
-        
-        return None
-
-
-def cleanup_ngrok():
-    """Clean up ngrok tunnel on exit"""
-    global ngrok_tunnel
-    if ngrok_tunnel:
-        try:
-            ngrok.disconnect(ngrok_tunnel.public_url)
-            ngrok.kill()
-            print("✓ ngrok tunnel closed")
-        except Exception as e:
-            print(f"⚠️  Error closing ngrok tunnel: {e}")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Clean up ngrok tunnel on shutdown"""
-    cleanup_ngrok()
 
 
 @app.head("/health")
@@ -378,6 +303,16 @@ def download_chromadb_from_s3():
         with tarfile.open(fileobj=BytesIO(backup_data), mode='r:gz') as tar:
             tar.extractall(path='.')
         
+        # Fix permissions for extracted files (important for Cloud Run)
+        print(f"  🔧 Fixing file permissions...")
+        if os.path.exists(CHROMADB_LOCAL_PATH):
+            # Make all files and directories writable
+            for root, dirs, files in os.walk(CHROMADB_LOCAL_PATH):
+                for d in dirs:
+                    os.chmod(os.path.join(root, d), 0o755)
+                for f in files:
+                    os.chmod(os.path.join(root, f), 0o644)
+        
         print(f"  ✓ ChromaDB restored from S3 successfully")
         return True
         
@@ -440,8 +375,13 @@ def upload_chromadb_to_s3(skip_if_extraction_in_progress=False):
         backup_lock.release()
 
 
-# Ensure chroma_db directory exists (create if it doesn't)
-os.makedirs(CHROMADB_LOCAL_PATH, exist_ok=True)
+# Ensure chroma_db directory exists (create if it doesn't) with proper permissions
+os.makedirs(CHROMADB_LOCAL_PATH, exist_ok=True, mode=0o755)
+# Ensure the directory is writable
+try:
+    os.chmod(CHROMADB_LOCAL_PATH, 0o755)
+except Exception as e:
+    print(f"⚠️  Warning: Could not set permissions on ChromaDB directory: {e}")
 
 # Global variables for RAG system
 embedding_model = None
@@ -519,7 +459,43 @@ def ensure_models_initialized():
                         print(f"✅ Existing collection loaded with {existing_count} chunks")
                     except Exception as e:
                         error_msg = str(e)
-                        if "dimension" in error_msg.lower() or "1536" in error_msg or "384" in error_msg:
+                        if "readonly" in error_msg.lower() or "read-only" in error_msg.lower() or "read only" in error_msg.lower() or "code: 1032" in error_msg:
+                            print(f"⚠️  Database is readonly. Attempting to fix permissions...")
+                            # Try to fix permissions on the database directory
+                            try:
+                                if os.path.exists(CHROMADB_LOCAL_PATH):
+                                    for root, dirs, files in os.walk(CHROMADB_LOCAL_PATH):
+                                        for d in dirs:
+                                            os.chmod(os.path.join(root, d), 0o755)
+                                        for f in files:
+                                            os.chmod(os.path.join(root, f), 0o644)
+                                    print("  ✓ Permissions fixed, retrying...")
+                                    # Retry the operation
+                                    existing_collection.add(
+                                        documents=["test"],
+                                        embeddings=[test_embedding],
+                                        metadatas=[{"test": "true"}],
+                                        ids=["dimension_test"]
+                                    )
+                                    existing_collection.delete(ids=["dimension_test"])
+                                    collection = existing_collection
+                                    existing_count = collection.count()
+                                    print(f"✅ Existing collection loaded with {existing_count} chunks")
+                                else:
+                                    raise Exception("ChromaDB directory not found after permission fix")
+                            except Exception as retry_error:
+                                print(f"⚠️  Permission fix failed: {retry_error}")
+                                print("  🔄 Deleting and recreating collection...")
+                                try:
+                                    chroma_client.delete_collection(name="pdf_documents")
+                                except:
+                                    pass
+                                collection = chroma_client.create_collection(
+                                    name="pdf_documents",
+                                    metadata={"hnsw:space": "cosine"}
+                                )
+                                print("✅ Collection recreated")
+                        elif "dimension" in error_msg.lower() or "1536" in error_msg or "384" in error_msg:
                             print(f"🔄 Collection has wrong embedding dimension. Resetting...")
                             try:
                                 chroma_client.delete_collection(name="pdf_documents")
@@ -533,14 +509,37 @@ def ensure_models_initialized():
                         else:
                             raise
                 except Exception as e:
-                    if "not found" in str(e).lower() or "does not exist" in str(e).lower():
+                    error_msg = str(e)
+                    if "readonly" in error_msg.lower() or "read-only" in error_msg.lower() or "read only" in error_msg.lower() or "code: 1032" in error_msg:
+                        print(f"⚠️  Database is readonly. Fixing permissions and recreating collection...")
+                        # Fix permissions
+                        try:
+                            if os.path.exists(CHROMADB_LOCAL_PATH):
+                                for root, dirs, files in os.walk(CHROMADB_LOCAL_PATH):
+                                    for d in dirs:
+                                        os.chmod(os.path.join(root, d), 0o755)
+                                    for f in files:
+                                        os.chmod(os.path.join(root, f), 0o644)
+                        except Exception as perm_error:
+                            print(f"  ⚠️  Could not fix permissions: {perm_error}")
+                        # Delete and recreate collection
+                        try:
+                            chroma_client.delete_collection(name="pdf_documents")
+                        except:
+                            pass
+                        collection = chroma_client.create_collection(
+                            name="pdf_documents",
+                            metadata={"hnsw:space": "cosine"}
+                        )
+                        print("✅ Collection recreated with proper permissions")
+                    elif "not found" in error_msg.lower() or "does not exist" in error_msg.lower():
                         collection = chroma_client.create_collection(
                             name="pdf_documents",
                             metadata={"hnsw:space": "cosine"}
                         )
                         print("✅ New collection created")
                     else:
-                        print(f"⚠️  Error accessing collection: {str(e)}")
+                        print(f"⚠️  Error accessing collection: {error_msg}")
                         try:
                             chroma_client.delete_collection(name="pdf_documents")
                         except:
@@ -2273,22 +2272,6 @@ if __name__ == "__main__":
     
     # Use PORT environment variable (Cloud Run sets this), default to 8080
     port = int(os.getenv("PORT", "8080"))
-    
-    # Start ngrok tunnel in background thread (non-blocking)
-    def start_ngrok_background():
-        """Start ngrok tunnel in background after a short delay"""
-        time.sleep(2)  # Wait for server to start
-        try:
-            public_url = start_ngrok_tunnel(port)
-            if public_url:
-                print(f"🎉 Service is accessible via ngrok at: {public_url}")
-        except Exception as e:
-            print(f"⚠️  Failed to start ngrok tunnel: {e}")
-            print("⚠️  Continuing without ngrok. Service will only be accessible locally.")
-    
-    # Start ngrok in background thread
-    if PYNGROK_AVAILABLE:
-        threading.Thread(target=start_ngrok_background, daemon=True).start()
     
     print(f"🚀 Starting server on port {port}...")
     uvicorn.run(app, host="0.0.0.0", port=port)
