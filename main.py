@@ -184,8 +184,23 @@ _pdf_names_cache_valid = False  # Flag to indicate if cache needs refresh
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize models on startup."""
-    initialize_models()
+    """Initialize models on startup in background thread to avoid blocking server startup."""
+    def init_in_background():
+        """Initialize models in background thread."""
+        try:
+            # Download ChromaDB from S3 first
+            print("📥 Starting ChromaDB download from S3...")
+            download_chromadb_from_s3()
+            # Then initialize models
+            print("🚀 Starting model initialization...")
+            initialize_models()
+            print("✅ Background initialization complete")
+        except Exception as e:
+            print(f"⚠️ Error during background initialization: {e}")
+    
+    # Start initialization in background thread (non-blocking)
+    threading.Thread(target=init_in_background, daemon=True).start()
+    print("🚀 Server starting, initialization running in background...")
 
 
 @app.head("/health")
@@ -366,9 +381,6 @@ def upload_chromadb_to_s3(skip_if_extraction_in_progress=False):
     finally:
         backup_lock.release()
 
-
-# Download ChromaDB from S3 on startup (if available)
-download_chromadb_from_s3()
 
 # Ensure chroma_db directory exists (create if it doesn't)
 os.makedirs(CHROMADB_LOCAL_PATH, exist_ok=True)
@@ -2039,4 +2051,6 @@ if __name__ == "__main__":
     print("  GOOGLE_CALENDAR_TOKEN=base64-encoded-token-pickle (optional, for pre-authenticated tokens)")
     print("="*80 + "\n")
     
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    # Use PORT environment variable (Cloud Run sets this), default to 8080
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
