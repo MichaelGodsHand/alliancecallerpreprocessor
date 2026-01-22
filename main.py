@@ -1401,10 +1401,51 @@ def process_extraction_job(job_id: str, files_data: list, use_ocr: bool, webhook
                 results.update(extracted_text)
                 print(f"  ✅ Successfully extracted and stored {len(extracted_text)} pages from {filename}")
                 
+                # Send progress webhook notification after each file is processed
+                if webhook_url:
+                    progress_data = {
+                        "job_id": job_id,
+                        "status": "processing",
+                        "current_file": filename,
+                        "current_file_index": idx,
+                        "total_files": len(files_data),
+                        "files_processed": idx,
+                        "total_pages_extracted": len(results),
+                        "total_pages_stored_in_db": stored_count,
+                        "total_pages_uploaded_to_s3": s3_upload_count,
+                        "progress_percentage": int((idx / len(files_data)) * 100),
+                        "ocr_enabled": use_ocr,
+                        "ocr_available": TESSERACT_FOUND,
+                        "errors": errors.copy() if errors else []
+                    }
+                    print(f"  📡 Sending progress webhook notification...")
+                    send_webhook_notification(webhook_url, job_id, progress_data)
+                
             except Exception as e:
                 error_msg = f"{filename}: {str(e)}"
                 errors.append(error_msg)
                 print(f"  ❌ Failed: {error_msg}")
+                
+                # Send progress webhook notification even on error (to report the error)
+                if webhook_url:
+                    progress_data = {
+                        "job_id": job_id,
+                        "status": "processing",
+                        "current_file": filename,
+                        "current_file_index": idx,
+                        "total_files": len(files_data),
+                        "files_processed": idx,
+                        "total_pages_extracted": len(results),
+                        "total_pages_stored_in_db": stored_count,
+                        "total_pages_uploaded_to_s3": s3_upload_count,
+                        "progress_percentage": int((idx / len(files_data)) * 100),
+                        "ocr_enabled": use_ocr,
+                        "ocr_available": TESSERACT_FOUND,
+                        "errors": errors.copy() if errors else [],
+                        "last_error": error_msg
+                    }
+                    print(f"  📡 Sending progress webhook notification (with error)...")
+                    send_webhook_notification(webhook_url, job_id, progress_data)
         
         # Backup ChromaDB to S3 after extraction completes
         if stored_count > 0 and s3_client is not None:
